@@ -96,12 +96,16 @@ _ensure_venv()
 
 import json  # noqa: E402
 import re  # noqa: E402
+import shlex  # noqa: E402
 import shutil  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
+from urllib.parse import urlsplit  # noqa: E402
+from urllib.request import url2pathname  # noqa: E402
 
-from textual import on, work  # noqa: E402
+from textual import events, on, work  # noqa: E402
 from textual.app import App, ComposeResult  # noqa: E402
 from textual.containers import Horizontal, Vertical  # noqa: E402
+from textual.message import Message  # noqa: E402
 from textual.widgets import (  # noqa: E402
     Button,
     DataTable,
@@ -119,6 +123,62 @@ from textual.worker import get_current_worker  # noqa: E402
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 VIDEO_EXTS = {".mp4", ".mov", ".mxf", ".mkv", ".m4v", ".avi"}
 OUTPUT_EXT = ".mp4"
+
+
+# --------------------------------------------------------------------------
+# Caminhos de entrada
+# --------------------------------------------------------------------------
+#
+# Um drag-and-drop no terminal vira uma colagem de texto com os caminhos, e
+# cada terminal cita de um jeito: Windows Terminal poe aspas duplas quando ha
+# espaco, GNOME Terminal e kitty usam aspas simples, Alacritty, Terminal.app e
+# iTerm2 escapam com barra invertida, uns poucos colam file:// URIs. Varios
+# arquivos vem separados por espaco (as vezes por quebra de linha).
+
+
+def clean_path(token: str) -> str:
+    """Tira as aspas em volta de um caminho e converte file:// URI em caminho."""
+    token = token.strip()
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+        token = token[1:-1]
+    if token.startswith("file://"):
+        token = url2pathname(urlsplit(token).path)
+    return token
+
+
+def split_paths(raw: str) -> list[Path]:
+    """Separa o texto do campo de entrada em caminhos.
+
+    Primeiro tenta o texto inteiro como um caminho so: e o que o usuario
+    digita a mao, com espaco e sem aspas, e nao pode ser fatiado. Se ele nao
+    existe, fatia com as regras de aspas do shell (no Windows a barra
+    invertida e separador, nao escape).
+    """
+    text = " ".join(line.strip() for line in raw.splitlines()).strip()
+    whole = clean_path(text)
+    if not whole:
+        return []
+    if Path(whole).expanduser().exists():
+        return [Path(whole).expanduser()]
+    try:
+        tokens = shlex.split(text, posix=os.name != "nt")
+    except ValueError:  # aspas sem fechar: ainda esta sendo digitado
+        return [Path(whole).expanduser()]
+    return [Path(clean_path(t)).expanduser() for t in tokens]
+
+
+def collect_videos(paths: list[Path]) -> list[Path]:
+    """Pastas contribuem seus videos (sem recursao); arquivos avulsos entram
+    como vieram, de qualquer extensao - o ffprobe decide se sao legiveis."""
+    found: dict[Path, None] = {}  # dict para deduplicar mantendo a ordem
+    for path in paths:
+        if path.is_dir():
+            for f in sorted(path.iterdir()):
+                if f.is_file() and f.suffix.lower() in VIDEO_EXTS:
+                    found[f] = None
+        else:
+            found[path] = None
+    return list(found)
 
 
 # --------------------------------------------------------------------------
@@ -400,6 +460,32 @@ COLUMNS = (
 )
 
 
+class PathInput(Input):
+    """Input que reconhece um drag-and-drop.
+
+    Se tudo que foi colado existe no disco, junta ao que ja esta no campo e
+    avisa o app com Dropped, em vez de colar como texto comum.
+    """
+
+    class Dropped(Message):
+        pass
+
+    def drop(self, text: str) -> bool:
+        paths = split_paths(text)
+        if not paths or not all(p.exists() for p in paths):
+            return False
+        text = " ".join(line.strip() for line in text.splitlines())
+        self.value = f"{self.value.strip()} {text}".strip()
+        self.cursor_position = len(self.value)
+        self.post_message(self.Dropped())
+        return True
+
+    def on_paste(self, event: events.Paste) -> None:
+        if self.drop(event.text):
+            event.prevent_default()  # senao o Input cola por cima
+            event.stop()
+
+
 class ResolvePrep(App):
     TITLE = "resolve-prep"
     SUB_TITLE = "HEVC 4:2:2 10-bit -> H.264 / H.265 all-intra em MP4"
@@ -446,7 +532,7 @@ class ResolvePrep(App):
         with Vertical(id="config"):
             with Horizontal(classes="row"):
                 yield Label("Entrada", classes="lbl")
-                yield Input(placeholder=r"pasta com os arquivos brutos", id="src")
+                yield PathInput(placeholder="pasta ou arquivos de vídeo — pode arrastar para cá", id="src")
             with Horizontal(classes="row"):
                 yield Label("Saída", classes="lbl")
                 yield Input(placeholder=r"pasta onde salvar os convertidos", id="dst")
@@ -482,7 +568,10 @@ class ResolvePrep(App):
             self.query_one("#scan", Button).disabled = True
         else:
             log.write(f"ffmpeg em [dim]{self.ffmpeg}[/]")
-            log.write("Informe a pasta de entrada e pressione [bold]Escanear[/].")
+            log.write(
+                "Informe a pasta de entrada, ou arraste pastas e arquivos para cá, "
+                "e pressione [bold]Escanear[/]."
+            )
 
         self.query_one("#src", Input).focus()
 
@@ -508,9 +597,18 @@ class ResolvePrep(App):
         dst = self.query_one("#dst", Input)
         if dst.value.strip():
             return
-        src = Path(event.value.strip().strip('"'))
-        if event.value.strip() and src.name:
-            dst.placeholder = str(src.parent / f"{src.name} - convertido")
+        paths = split_paths(event.value)
+        if not paths:
+            return
+        base = paths[0].parent if paths[0].is_file() else paths[0]
+        if base.name:
+            dst.placeholder = str(base.parent / f"{base.name} - convertido")
+
+    def on_paste(self, event: events.Paste) -> None:
+        """Drop com o foco fora dos campos de texto (tabela, botão): vai para a entrada."""
+        src = self.query_one("#src", PathInput)
+        if src.drop(event.text):
+            src.focus()
 
     # -- escanear ---------------------------------------------------------
 
@@ -518,22 +616,24 @@ class ResolvePrep(App):
         self.scan()
 
     @on(Button.Pressed, "#scan")
+    @on(Input.Submitted, "#src")
+    @on(PathInput.Dropped)
     def _on_scan(self) -> None:
         self.scan()
 
     def scan(self) -> None:
-        raw = self.query_one("#src", Input).value.strip().strip('"')
-        if not raw:
-            self.notify("Informe a pasta de entrada.", severity="warning")
+        paths = split_paths(self.query_one("#src", Input).value)
+        if not paths:
+            self.notify("Informe a pasta ou os arquivos de entrada.", severity="warning")
             return
-        src = Path(raw).expanduser()
-        if not src.is_dir():
-            self.notify(f"Pasta não encontrada: {src}", severity="error")
+        missing = next((p for p in paths if not p.exists()), None)
+        if missing is not None:
+            self.notify(f"Não encontrado: {missing}", severity="error")
             return
 
-        found = sorted(p for p in src.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS)
+        found = collect_videos(paths)
         if not found:
-            self.notify("Nenhum arquivo de vídeo nessa pasta.", severity="warning")
+            self.notify("Nenhum arquivo de vídeo aí.", severity="warning")
             return
 
         self.write_log(f"\n[bold]Lendo {len(found)} arquivo(s)…[/]")
@@ -612,7 +712,7 @@ class ResolvePrep(App):
             self.notify("Escaneie uma pasta primeiro.", severity="warning")
             return
 
-        raw = self.query_one("#dst", Input).value.strip().strip('"')
+        raw = clean_path(self.query_one("#dst", Input).value)
         if not raw:
             raw = self.query_one("#dst", Input).placeholder
         if not raw or raw.startswith("pasta onde"):

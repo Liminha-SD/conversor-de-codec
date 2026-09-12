@@ -7,13 +7,13 @@ set "HERE=%~dp0"
 rem ======================================================================
 rem  run.bat - sobe o resolve-prep no Windows sem precisar instalar nada
 rem  na mao. Verifica Python e ffmpeg, instala o que faltar, confere a
-rem  .venv e inicia o programa. Pode dar dois cliques.
+rem  venv e inicia o programa. Pode dar dois cliques.
 rem
 rem  Python  - via winget (vem no Windows 10/11). Sem winget, avisa e para.
 rem  ffmpeg  - usa o do PATH se houver; senao baixa a versao portatil
 rem            para a pasta tools\ ao lado deste arquivo.
-rem  .venv   - o main.py cria e instala as dependencias sozinho; aqui so
-rem            reaproveitamos a .venv se ela existe e ainda funciona.
+rem  venv   - o main.py cria e instala as dependencias sozinho; aqui so
+rem            reaproveitamos a venv se ela existe e ainda funciona.
 rem ======================================================================
 
 echo [resolve-prep] verificando o ambiente...
@@ -77,11 +77,11 @@ if not defined FFMPEG_OK (
 echo [resolve-prep] ffmpeg ok
 
 rem ---- venv ------------------------------------------------------------
-set "VENV_PY=.venv\Scripts\python.exe"
+set "VENV_PY=venv\Scripts\python.exe"
 if exist "%VENV_PY%" (
     "%VENV_PY%" -c "import sys" >nul 2>&1 || (
-        echo [resolve-prep] a .venv esta quebrada, recriando...
-        rmdir /s /q ".venv"
+        echo [resolve-prep] a venv esta quebrada, recriando...
+        rmdir /s /q "venv"
     )
 )
 

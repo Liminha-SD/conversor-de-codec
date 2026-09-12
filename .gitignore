@@ -51,3 +51,5 @@ Desktop.ini
 # Arquivos de configuração locais
 .env
 .claude
+BRIEFING.md
+config.json

@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-resolve-prep - TUI para transcodificar midia que o DaVinci Resolve (free) nao
-decodifica (HEVC 4:2:2 10-bit da Canon R6 Mark II, entre outros) para H.264 ou
-H.265 all-intra, sempre em MP4.
+resolve-prep - transcodifica mídia que o DaVinci Resolve (free) não decodifica
+(HEVC 4:2:2 10 bits da Canon R6 Mark II, entre outros) para H.264 ou H.265
+all-intra, sempre em MP4.
 
-A saida e sempre .mp4 de verdade: o muxer mp4 do ffmpeg so aceita H.264/H.265
-(ProRes e DNxHR exigem .mov). All-intra deixa o scrub e o corte fluidos no
-Resolve, quase como um codec intermediario, num arquivo bem menor.
+Interface PySide6. A conversão em si mora no transcoder.py.
 
-Roda sozinho: se nao estiver dentro de uma venv com as dependencias, cria
-".venv" ao lado deste arquivo, instala o que precisa e se reexecuta la dentro.
+Roda sozinho: se não estiver dentro da venv/, cria a venv ao lado deste
+arquivo, instala o requirements.txt e se reexecuta lá dentro.
 
-Requer ffmpeg e ffprobe no PATH.
-    Windows: de dois cliques em run.bat - ele instala Python e ffmpeg se
-             faltarem e sobe o programa. Ou: winget install Gyan.FFmpeg
+Requer ffmpeg e ffprobe no PATH (ou em tools\\ffmpeg-*\\bin, onde o run.bat
+deixa a cópia portátil no Windows).
+    Windows: dê dois cliques em run.bat. Ou: winget install Gyan.FFmpeg
     Arch:    sudo pacman -S ffmpeg
 """
 
@@ -24,48 +22,50 @@ import subprocess
 import sys
 from pathlib import Path
 
-# --------------------------------------------------------------------------
-# Bootstrap da venv - precisa rodar antes de qualquer import de terceiros
-# --------------------------------------------------------------------------
-
-REQUIREMENTS = ["textual>=1.0"]
+HERE = Path(__file__).resolve().parent
 _BOOTSTRAP_FLAG = "RESOLVE_PREP_BOOTSTRAPPED"
 
 
 def _venv_python(venv_dir: Path) -> Path:
-    if os.name == "nt":
-        return venv_dir / "Scripts" / "python.exe"
-    return venv_dir / "bin" / "python"
+    return venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def _in_venv() -> bool:
-    return sys.prefix != sys.base_prefix
-
-
-def _deps_ok() -> bool:
+def _pip_install(python: Path) -> None:
+    print("[resolve-prep] instalando dependências")
+    subprocess.run([str(python), "-m", "pip", "install", "-q", "--upgrade", "pip"], check=False)
     try:
-        import textual  # noqa: F401
-    except ImportError:
-        return False
-    return True
+        subprocess.run(
+            [str(python), "-m", "pip", "install", "-q", "-r", str(HERE / "requirements.txt")],
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        sys.exit("resolve-prep: pip falhou. Verifique sua conexão e tente de novo.")
 
 
 def _ensure_venv() -> None:
-    """Garante que estamos rodando numa venv com as dependencias instaladas."""
-    if _in_venv() and _deps_ok():
-        return
+    """Garante que rodamos no python de venv/ com as dependências instaladas.
 
-    script = Path(__file__).resolve()
-    venv_dir = script.parent / ".venv"
-    py = _venv_python(venv_dir)
+    Se venv/ existe e não somos ela, reexecuta lá dentro. Se não existe, cria
+    e instala o requirements.txt antes, para o duplo clique no Windows
+    funcionar sem preparar nada na mão.
+    """
+    venv_dir = HERE / "venv"
+    venv_py = _venv_python(venv_dir)
+
+    if Path(sys.prefix).resolve() == venv_dir.resolve():
+        try:
+            import PySide6  # noqa: F401
+        except ImportError:
+            _pip_install(venv_py)
+        return
 
     if os.environ.get(_BOOTSTRAP_FLAG):
         sys.exit(
-            "resolve-prep: a venv foi criada mas as dependencias nao subiram.\n"
-            f'  Rode manualmente: "{py}" -m pip install {" ".join(REQUIREMENTS)}'
+            "resolve-prep: a venv existe mas não consegui rodar dentro dela.\n"
+            f'  Rode manualmente: "{venv_py}" -m pip install -r requirements.txt'
         )
 
-    if not py.exists():
+    if not venv_py.is_file():
         print(f"[resolve-prep] criando venv em {venv_dir}")
         try:
             subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
@@ -75,800 +75,759 @@ def _ensure_venv() -> None:
                 "  No Debian/Ubuntu instale o pacote python3-venv.\n"
                 "  No Windows reinstale o Python marcando 'Add to PATH'."
             )
+        _pip_install(venv_py)
 
-    print("[resolve-prep] instalando dependencias")
-    subprocess.run([str(py), "-m", "pip", "install", "-q", "--upgrade", "pip"], check=False)
-    try:
-        subprocess.run([str(py), "-m", "pip", "install", "-q", *REQUIREMENTS], check=True)
-    except subprocess.CalledProcessError:
-        sys.exit("resolve-prep: pip falhou. Verifique sua conexao e tente de novo.")
-
+    script = str(Path(__file__).resolve())
     env = {**os.environ, _BOOTSTRAP_FLAG: "1"}
-    print("[resolve-prep] subindo a interface\n")
-    raise SystemExit(subprocess.call([str(py), str(script), *sys.argv[1:]], env=env))
+    if os.name == "nt":
+        # No Windows o execv não substitui o processo: quem nos chamou
+        # (run.bat, atalho) acharia que o programa já terminou.
+        raise SystemExit(subprocess.call([str(venv_py), script, *sys.argv[1:]], env=env))
+    os.execve(str(venv_py), [str(venv_py), script, *sys.argv[1:]], env)
 
 
 _ensure_venv()
 
 # --------------------------------------------------------------------------
-# A partir daqui ja estamos dentro da venv
+# A partir daqui já estamos dentro da venv
 # --------------------------------------------------------------------------
 
 import json  # noqa: E402
-import re  # noqa: E402
-import shlex  # noqa: E402
-import shutil  # noqa: E402
-from dataclasses import dataclass  # noqa: E402
-from urllib.parse import urlsplit  # noqa: E402
-from urllib.request import url2pathname  # noqa: E402
 
-from textual import events, on, work  # noqa: E402
-from textual.app import App, ComposeResult  # noqa: E402
-from textual.containers import Horizontal, Vertical  # noqa: E402
-from textual.message import Message  # noqa: E402
-from textual.widgets import (  # noqa: E402
-    Button,
-    DataTable,
-    Footer,
-    Header,
-    Input,
-    Label,
-    ProgressBar,
-    RichLog,
-    Select,
-    Static,
-)
-from textual.worker import get_current_worker  # noqa: E402
-
-CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
-VIDEO_EXTS = {".mp4", ".mov", ".mxf", ".mkv", ".m4v", ".avi"}
-OUTPUT_EXT = ".mp4"
-
-
-# --------------------------------------------------------------------------
-# Caminhos de entrada
-# --------------------------------------------------------------------------
-#
-# Um drag-and-drop no terminal vira uma colagem de texto com os caminhos, e
-# cada terminal cita de um jeito: Windows Terminal poe aspas duplas quando ha
-# espaco, GNOME Terminal e kitty usam aspas simples, Alacritty, Terminal.app e
-# iTerm2 escapam com barra invertida, uns poucos colam file:// URIs. Varios
-# arquivos vem separados por espaco (as vezes por quebra de linha).
-
-
-def clean_path(token: str) -> str:
-    """Tira as aspas em volta de um caminho e converte file:// URI em caminho."""
-    token = token.strip()
-    if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
-        token = token[1:-1]
-    if token.startswith("file://"):
-        token = url2pathname(urlsplit(token).path)
-    return token
-
-
-def split_paths(raw: str) -> list[Path]:
-    """Separa o texto do campo de entrada em caminhos.
-
-    Primeiro tenta o texto inteiro como um caminho so: e o que o usuario
-    digita a mao, com espaco e sem aspas, e nao pode ser fatiado. Se ele nao
-    existe, fatia com as regras de aspas do shell (no Windows a barra
-    invertida e separador, nao escape).
-    """
-    text = " ".join(line.strip() for line in raw.splitlines()).strip()
-    whole = clean_path(text)
-    if not whole:
-        return []
-    if Path(whole).expanduser().exists():
-        return [Path(whole).expanduser()]
-    try:
-        tokens = shlex.split(text, posix=os.name != "nt")
-    except ValueError:  # aspas sem fechar: ainda esta sendo digitado
-        return [Path(whole).expanduser()]
-    return [Path(clean_path(t)).expanduser() for t in tokens]
-
-
-def collect_videos(paths: list[Path]) -> list[Path]:
-    """Pastas contribuem seus videos (sem recursao); arquivos avulsos entram
-    como vieram, de qualquer extensao - o ffprobe decide se sao legiveis."""
-    found: dict[Path, None] = {}  # dict para deduplicar mantendo a ordem
-    for path in paths:
-        if path.is_dir():
-            for f in sorted(path.iterdir()):
-                if f.is_file() and f.suffix.lower() in VIDEO_EXTS:
-                    found[f] = None
-        else:
-            found[path] = None
-    return list(found)
-
-
-# --------------------------------------------------------------------------
-# Presets
-# --------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Preset:
-    key: str
-    label: str
-    args: tuple[str, ...]
-    mbps: int  # estimativa de bitrate em 1080p59.94, para o calculo de espaco
-    tag: str = ""  # fourcc opcional; vazio = o padrao do muxer
-
-
-PRESETS: tuple[Preset, ...] = (
-    Preset(
-        "h264_hq",
-        "H.264 HQ - 8 bits 4:2:0, all-intra, padrao para o Resolve free",
-        (
-            "-c:v", "libx264", "-preset", "medium", "-crf", "12",
-            # -g 1 torna todo frame um keyframe: e o que da o scrub leve.
-            "-g", "1", "-profile:v", "high", "-pix_fmt", "yuv420p",
-        ),
-        90,
-    ),
-    Preset(
-        "h264_max",
-        "H.264 Max - 8 bits 4:2:0, all-intra quase sem perda, grading pesado",
-        (
-            "-c:v", "libx264", "-preset", "slow", "-crf", "8",
-            "-g", "1", "-profile:v", "high", "-pix_fmt", "yuv420p",
-        ),
-        180,
-    ),
-    Preset(
-        "h265_hq",
-        "H.265 HQ - 8 bits 4:2:0, all-intra, ~metade do tamanho do H.264",
-        (
-            "-c:v", "libx265", "-preset", "medium", "-crf", "16",
-            "-g", "1", "-pix_fmt", "yuv420p",
-        ),
-        50,
-        # hev1 (o padrao) trava em varios players; hvc1 e o que abre em todos.
-        "hvc1",
-    ),
-    Preset(
-        "h265_10bit",
-        "H.265 10 bits 4:2:0 - preserva os 10 bits (o Resolve free pode recusar)",
-        (
-            "-c:v", "libx265", "-preset", "medium", "-crf", "16",
-            "-g", "1", "-pix_fmt", "yuv420p10le",
-        ),
-        60,
-        "hvc1",
-    ),
-    Preset(
-        "h264_proxy",
-        "H.264 Proxy - long-GOP leve, so para corte e visualizacao",
-        (
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-profile:v", "high", "-pix_fmt", "yuv420p",
-        ),
-        12,
-    ),
+from PySide6.QtCore import Qt, QThread, QTimer, Signal  # noqa: E402
+from PySide6.QtGui import QBrush, QColor, QKeySequence, QShortcut  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QAbstractItemView,
+    QApplication,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
 
-PRESET_BY_KEY = {p.key: p for p in PRESETS}
+import transcoder  # noqa: E402
+from dark_theme import COLORS, apply_theme, set_default_font  # noqa: E402
+from transcoder import DEFAULT_PRESET, PRESET_BY_KEY, PRESETS, MediaInfo, Preset, TranscodeError  # noqa: E402
+
+FILTRO_ARQUIVOS = (
+    "Vídeos (" + " ".join(f"*{ext}" for ext in sorted(transcoder.VIDEO_EXTS)) + ");;"
+    "Todos os arquivos (*)"
+)
+COLUNAS = ("Arquivo", "Codec", "Resolução", "FPS", "Chroma", "Bits", "Range", "Status")
+COL_ARQUIVO, COL_CODEC, COL_RES, COL_FPS, COL_CHROMA, COL_BITS, COL_RANGE, COL_STATUS = range(8)
+LENDO = "lendo..."  # status de uma linha que ainda não passou pelo ffprobe
+
+# --------------------------------------------------------------------------
+# Configuração persistente (config.json ao lado do programa)
+# --------------------------------------------------------------------------
+
+CONFIG_FILE = transcoder.app_dir() / "config.json"
+
+
+def carregar_config() -> dict:
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def salvar_config(config: dict) -> None:
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+    except OSError as exc:
+        print(f"[resolve-prep] não consegui salvar o config.json: {exc}")
 
 
 # --------------------------------------------------------------------------
-# Leitura de metadados
+# Workers
 # --------------------------------------------------------------------------
 
-PIX_FMT = {
-    "yuv420p": ("4:2:0", "8"),
-    "yuvj420p": ("4:2:0", "8"),
-    "yuv422p": ("4:2:2", "8"),
-    "yuvj422p": ("4:2:2", "8"),
-    "yuv444p": ("4:4:4", "8"),
-    "yuv420p10le": ("4:2:0", "10"),
-    "yuv422p10le": ("4:2:2", "10"),
-    "yuv444p10le": ("4:4:4", "10"),
-    "yuv422p12le": ("4:2:2", "12"),
-    "yuv444p12le": ("4:4:4", "12"),
-}
 
-# Chroma/profundidade que o Resolve free nao decodifica no Windows.
-NEEDS_TRANSCODE = {("4:2:2", "10"), ("4:2:2", "12"), ("4:4:4", "10"), ("4:4:4", "12")}
+class LeitorWorker(QThread):
+    """Roda o ffprobe nos arquivos novos fora da thread da interface."""
 
-# Um valor que o ffprobe reporta mas o filtro setparams nao conhece derruba a
-# conversao inteira, entao so repassamos o que esta nestas listas
-# (ffmpeg -h filter=setparams). Fora delas, fica o default bt709.
-COLOR_VALUES = {
-    "colorspace": {
-        "gbr", "bt709", "fcc", "bt470bg", "smpte170m", "smpte240m", "ycgco",
-        "ycgco-re", "ycgco-ro", "bt2020nc", "bt2020c", "smpte2085",
-        "chroma-derived-nc", "chroma-derived-c", "ictcp", "ipt-c2",
-    },
-    "primaries": {
-        "bt709", "bt470m", "bt470bg", "smpte170m", "smpte240m", "film",
-        "bt2020", "smpte428", "smpte431", "smpte432", "jedec-p22", "ebu3213",
-    },
-    "trc": {
-        "bt709", "bt470m", "bt470bg", "smpte170m", "smpte240m", "linear",
-        "log100", "log316", "iec61966-2-4", "bt1361e", "iec61966-2-1",
-        "bt2020-10", "bt2020-12", "smpte2084", "smpte428", "arib-std-b67",
-    },
-}
+    lido = Signal(object)  # MediaInfo
 
+    def __init__(self, ffprobe: str, caminhos: list[Path]) -> None:
+        super().__init__()
+        self._ffprobe = ffprobe
+        self._caminhos = caminhos
+        self._cancelado = False
 
-@dataclass
-class MediaInfo:
-    path: Path
-    codec: str = "?"
-    width: int = 0
-    height: int = 0
-    fps: float = 0.0
-    chroma: str = "?"
-    depth: str = "?"
-    full_range: bool = False
-    colorspace: str = "bt709"
-    primaries: str = "bt709"
-    trc: str = "bt709"
-    duration: float = 0.0
-    timecode: str | None = None
-    status: str = "pendente"
+    def cancelar(self) -> None:
+        self._cancelado = True
 
-    @property
-    def resolution(self) -> str:
-        return f"{self.width}x{self.height}" if self.width else "?"
-
-    @property
-    def flagged(self) -> bool:
-        """True se o Resolve free provavelmente nao abre este arquivo."""
-        return (self.chroma, self.depth) in NEEDS_TRANSCODE
-
-
-def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd, capture_output=True, text=True, errors="replace", creationflags=CREATE_NO_WINDOW
-    )
-
-
-def probe(ffprobe: str, path: Path) -> MediaInfo:
-    info = MediaInfo(path=path)
-    res = _run(
-        [ffprobe, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)]
-    )
-    if res.returncode != 0:
-        info.status = "ilegivel"
-        return info
-
-    try:
-        data = json.loads(res.stdout)
-    except json.JSONDecodeError:
-        info.status = "ilegivel"
-        return info
-
-    streams = data.get("streams", [])
-    fmt = data.get("format", {})
-
-    video = next((s for s in streams if s.get("codec_type") == "video"), None)
-    if video is None:
-        info.status = "sem video"
-        return info
-
-    info.codec = video.get("codec_name", "?").upper()
-    info.width = int(video.get("width") or 0)
-    info.height = int(video.get("height") or 0)
-
-    num, _, den = (video.get("r_frame_rate") or "0/1").partition("/")
-    try:
-        info.fps = round(int(num) / int(den), 3) if int(den) else 0.0
-    except (ValueError, ZeroDivisionError):
-        info.fps = 0.0
-
-    info.chroma, info.depth = PIX_FMT.get(video.get("pix_fmt", ""), ("?", "?"))
-    info.full_range = video.get("color_range") == "pc"
-
-    for attr, key in (("colorspace", "color_space"), ("primaries", "color_primaries"), ("trc", "color_transfer")):
-        val = video.get(key)
-        if val in COLOR_VALUES[attr]:
-            setattr(info, attr, val)
-
-    try:
-        info.duration = float(fmt.get("duration") or video.get("duration") or 0.0)
-    except ValueError:
-        info.duration = 0.0
-
-    tc = (fmt.get("tags") or {}).get("timecode")
-    if not tc:
-        for s in streams:
-            tc = (s.get("tags") or {}).get("timecode")
-            if tc:
+    def run(self) -> None:
+        for caminho in self._caminhos:
+            if self._cancelado:
                 break
-    info.timecode = tc
-
-    return info
+            self.lido.emit(transcoder.probe(self._ffprobe, caminho))
 
 
-def build_cmd(ffmpeg: str, info: MediaInfo, dst: Path, preset: Preset) -> list[str]:
-    # -loglevel error para o x265 nao despejar linhas de info no stdout, que
-    # o parser de progresso trataria como erro.
-    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(info.path)]
+class ConversorWorker(QThread):
+    """Roda a fila de conversões fora da thread da interface."""
 
-    filters = []
-    # Canon grava full range (0-1023). H.264/H.265 de edicao sao video range
-    # (64-940). Sem esta conversao o preto esmaga e o branco estoura no Resolve.
-    if info.full_range:
-        filters.append("scale=in_range=full:out_range=limited")
-    # As opcoes -color_* abaixo nao bastam: o filtergraph propaga as
-    # propriedades do frame e sobrescreve o que o encoder recebeu, e o arquivo
-    # sai com primaries/trc "unknown". setparams etiqueta na saida do grafo.
-    filters.append(
-        "setparams=range=tv"
-        f":colorspace={info.colorspace}"
-        f":color_primaries={info.primaries}"
-        f":color_trc={info.trc}"
-    )
-    cmd += ["-vf", ",".join(filters)]
+    arquivo_iniciado = Signal(int, str, str)       # índice, nome, destino
+    progresso = Signal(int, float, str)            # índice, fração, velocidade
+    arquivo_terminado = Signal(int, str, str)      # índice, estado, mensagem
+    fila_terminada = Signal(int, int, int, bool)   # convertidos, falhas, pulados, cancelado
 
-    cmd += list(preset.args)
-    if preset.tag:
-        cmd += ["-tag:v", preset.tag]
-    cmd += [
-        "-color_range", "tv",
-        "-colorspace", info.colorspace,
-        "-color_primaries", info.primaries,
-        "-color_trc", info.trc,
-        # mp4 nao aceita PCM; AAC 320k e transparente o bastante para edicao.
-        "-c:a", "aac",
-        "-b:a", "320k",
-        "-ar", "48000",
-    ]
-    if info.timecode:
-        cmd += ["-timecode", info.timecode]
-    # write_colr grava as tags de cor no container; sem isso o Resolve pode
-    # ignorar o bt709 e interpretar a imagem errado.
-    cmd += ["-movflags", "+write_colr+faststart", "-progress", "pipe:1", "-nostats", str(dst)]
-    return cmd
+    def __init__(
+        self, ffmpeg: str, fila: list[MediaInfo], raiz: Path | None, preset: Preset
+    ) -> None:
+        super().__init__()
+        self._ffmpeg = ffmpeg
+        self._fila = fila
+        self._raiz = raiz
+        self._preset = preset
+        self._cancelado = False
 
+    def cancelar(self) -> None:
+        self._cancelado = True
 
-def human_size(num_bytes: float) -> str:
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if abs(num_bytes) < 1024:
-            return f"{num_bytes:.1f} {unit}"
-        num_bytes /= 1024
-    return f"{num_bytes:.1f} PB"
+    def run(self) -> None:
+        ok = falhas = pulados = 0
+        produzidos: set[Path] = set()
 
+        for n, info in enumerate(self._fila):
+            if self._cancelado:
+                break
 
-def estimate_output(info: MediaInfo, preset: Preset) -> float:
-    """Bytes estimados, escalando o bitrate de referencia pela area e pelo fps."""
-    if not info.duration or not info.width:
-        return 0.0
-    area_ratio = (info.width * info.height) / (1920 * 1080)
-    fps_ratio = (info.fps / 59.94) if info.fps else 1.0
-    mbps = preset.mbps * area_ratio * fps_ratio
-    return mbps * 1_000_000 / 8 * info.duration
+            if not info.readable:
+                pulados += 1
+                self.arquivo_terminado.emit(n, "pulado", f"o ffprobe não leu o arquivo ({info.status})")
+                continue
+
+            destino = transcoder.output_path(info.path, self._raiz)
+
+            # Duas pastas de origem com o mesmo nome (cartões diferentes, por
+            # exemplo) cairiam na mesma pasta de saída e se sobrescreveriam.
+            if destino in produzidos:
+                pulados += 1
+                self.arquivo_terminado.emit(n, "pulado", f"destino repetido: {destino}")
+                continue
+
+            try:
+                mesmo_arquivo = destino.resolve() == info.path.resolve()
+            except OSError:
+                mesmo_arquivo = False
+            if mesmo_arquivo:
+                pulados += 1
+                self.arquivo_terminado.emit(n, "pulado", "a saída sobrescreveria o original")
+                continue
+
+            if destino.exists() and destino.stat().st_mtime >= info.path.stat().st_mtime:
+                pulados += 1
+                produzidos.add(destino)
+                self.arquivo_terminado.emit(n, "existe", str(destino))
+                continue
+
+            self.arquivo_iniciado.emit(n, info.path.name, str(destino))
+            try:
+                transcoder.convert(
+                    self._ffmpeg,
+                    info,
+                    destino,
+                    self._preset,
+                    on_progress=lambda fracao, vel, i=n: self.progresso.emit(i, fracao, vel),
+                    should_cancel=lambda: self._cancelado,
+                )
+            except TranscodeError as exc:
+                # Cancelar é uma decisão do usuário, não uma falha do arquivo.
+                if self._cancelado:
+                    self.arquivo_terminado.emit(n, "cancelado", "interrompido")
+                    break
+                falhas += 1
+                self.arquivo_terminado.emit(n, "falha", str(exc))
+            except Exception as exc:  # noqa: BLE001 - a fila não pode morrer por um arquivo
+                falhas += 1
+                self.arquivo_terminado.emit(n, "falha", f"Erro inesperado: {exc}")
+            else:
+                ok += 1
+                produzidos.add(destino)
+                self.arquivo_terminado.emit(n, "ok", str(destino))
+
+        self.fila_terminada.emit(ok, falhas, pulados, self._cancelado)
 
 
 # --------------------------------------------------------------------------
-# App
+# Janela
 # --------------------------------------------------------------------------
 
-TIME_RE = re.compile(r"out_time=(\d+):(\d\d):(\d\d(?:\.\d+)?)")
 
-# (rotulo exibido, chave usada em update_cell)
-COLUMNS = (
-    ("Arquivo", "file"),
-    ("Codec", "codec"),
-    ("Resolução", "res"),
-    ("FPS", "fps"),
-    ("Chroma", "chroma"),
-    ("Bits", "depth"),
-    ("Range", "range"),
-    ("Status", "status"),
-)
-
-
-class PathInput(Input):
-    """Input que reconhece um drag-and-drop.
-
-    Se tudo que foi colado existe no disco, junta ao que ja esta no campo e
-    avisa o app com Dropped, em vez de colar como texto comum.
-    """
-
-    class Dropped(Message):
-        pass
-
-    def drop(self, text: str) -> bool:
-        paths = split_paths(text)
-        if not paths or not all(p.exists() for p in paths):
-            return False
-        text = " ".join(line.strip() for line in text.splitlines())
-        self.value = f"{self.value.strip()} {text}".strip()
-        self.cursor_position = len(self.value)
-        self.post_message(self.Dropped())
-        return True
-
-    def on_paste(self, event: events.Paste) -> None:
-        if self.drop(event.text):
-            event.prevent_default()  # senao o Input cola por cima
-            event.stop()
-
-
-class ResolvePrep(App):
-    TITLE = "resolve-prep"
-    SUB_TITLE = "HEVC 4:2:2 10-bit -> H.264 / H.265 all-intra em MP4"
-
-    CSS = """
-    Screen { layout: vertical; }
-
-    #config { height: auto; padding: 1 2 0 2; }
-    .row { height: 3; align-vertical: middle; }
-    .lbl { width: 10; content-align: right middle; padding-right: 2; color: $text-muted; }
-    #config Input { width: 1fr; }
-    #preset { width: 1fr; }
-    #scan { margin-left: 2; min-width: 14; }
-
-    #files { height: 1fr; min-height: 8; margin: 1 2; }
-
-    #progress-row { height: 3; padding: 0 2; align-vertical: middle; }
-    #bar { width: 1fr; }
-    #progress-label { width: auto; padding-left: 2; color: $text-muted; }
-
-    #log { height: 10; margin: 0 2; border: round $panel; padding: 0 1; }
-
-    #actions { height: 3; padding: 0 2 1 2; }
-    #actions Button { margin-right: 2; min-width: 16; }
-    """
-
-    BINDINGS = [
-        ("s", "scan", "Escanear"),
-        ("c", "convert", "Converter"),
-        ("x", "cancel", "Cancelar"),
-        ("q", "quit", "Sair"),
-    ]
-
+class Janela(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.ffmpeg = shutil.which("ffmpeg") or ""
-        self.ffprobe = shutil.which("ffprobe") or ""
-        self.files: list[MediaInfo] = []
-        self.row_keys: list = []
-        self._proc: subprocess.Popen | None = None
+        self.setWindowTitle("resolve-prep")
+        # Só a largura é fixada: a altura mínima vem do layout, senão a
+        # janela aceita encolher abaixo do que os grupos precisam e eles se
+        # sobrepõem.
+        self.setMinimumWidth(920)
+        self.resize(1000, 860)
+        self.setAcceptDrops(True)
 
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
-        with Vertical(id="config"):
-            with Horizontal(classes="row"):
-                yield Label("Entrada", classes="lbl")
-                yield PathInput(placeholder="pasta ou arquivos de vídeo — pode arrastar para cá", id="src")
-            with Horizontal(classes="row"):
-                yield Label("Saída", classes="lbl")
-                yield Input(placeholder=r"pasta onde salvar os convertidos", id="dst")
-            with Horizontal(classes="row"):
-                yield Label("Preset", classes="lbl")
-                yield Select(
-                    [(p.label, p.key) for p in PRESETS],
-                    value="h264_hq",
-                    allow_blank=False,
-                    id="preset",
-                )
-                yield Button("Escanear", variant="primary", id="scan")
-        yield DataTable(id="files", zebra_stripes=True, cursor_type="row")
-        with Horizontal(id="progress-row"):
-            yield ProgressBar(total=100, show_eta=False, id="bar")
-            yield Static("parado", id="progress-label")
-        yield RichLog(id="log", highlight=True, markup=True, wrap=True)
-        with Horizontal(id="actions"):
-            yield Button("Converter", variant="success", id="convert", disabled=True)
-            yield Button("Cancelar", variant="error", id="cancel", disabled=True)
-        yield Footer()
+        self._config = carregar_config()
+        raiz = self._config.get("pasta_saida")
+        self._raiz: Path | None = Path(raiz) if raiz else None
 
-    def on_mount(self) -> None:
-        table = self.query_one("#files", DataTable)
-        for label, key in COLUMNS:
-            table.add_column(label, key=key)
-        log = self.query_one("#log", RichLog)
+        self._fila: list[MediaInfo] = []
+        self._pendentes: list[Path] = []
+        self._leitor: LeitorWorker | None = None
+        self._worker: ConversorWorker | None = None
+        self._total = 0
 
-        if not self.ffmpeg or not self.ffprobe:
-            log.write("[bold red]ffmpeg/ffprobe não encontrados no PATH.[/]")
-            log.write("  Windows: [bold]winget install Gyan.FFmpeg[/]")
-            log.write("  Arch:    [bold]sudo pacman -S ffmpeg[/]")
-            self.query_one("#scan", Button).disabled = True
+        try:
+            self._ffmpeg, self._ffprobe = transcoder.find_ffmpeg()
+            self._erro_ffmpeg = ""
+        except TranscodeError as exc:
+            self._ffmpeg = self._ffprobe = ""
+            self._erro_ffmpeg = str(exc)
+
+        raiz_widget = QWidget()
+        layout = QVBoxLayout(raiz_widget)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        titulo = QLabel("resolve-prep")
+        titulo.setObjectName("title")
+        subtitulo = QLabel(
+            "Transcodifica o que o DaVinci Resolve free não abre (HEVC 4:2:2 10 bits da "
+            "Canon, por exemplo) para H.264 ou H.265 all-intra em MP4, com cor e "
+            "timecode preservados."
+        )
+        subtitulo.setObjectName("subtitle")
+        subtitulo.setWordWrap(True)
+        layout.addWidget(titulo)
+        layout.addWidget(subtitulo)
+
+        separador = QFrame()
+        separador.setObjectName("separator")
+        separador.setFrameShape(QFrame.Shape.HLine)
+        layout.addWidget(separador)
+
+        layout.addWidget(self._grupo_arquivos(), stretch=3)
+        layout.addWidget(self._grupo_opcoes())
+        layout.addWidget(self._grupo_progresso())
+        layout.addWidget(self._grupo_log(), stretch=1)
+        layout.addLayout(self._barra_acoes())
+
+        self.setCentralWidget(raiz_widget)
+
+        if self._erro_ffmpeg:
+            self._escrever(self._erro_ffmpeg)
         else:
-            log.write(f"ffmpeg em [dim]{self.ffmpeg}[/]")
-            log.write(
-                "Informe a pasta de entrada, ou arraste pastas e arquivos para cá, "
-                "e pressione [bold]Escanear[/]."
-            )
+            self._escrever(f"ffmpeg: {self._ffmpeg}")
+            self._escrever("Arraste pastas ou arquivos para a janela, ou use os botões acima.")
+        self._atualizar_estado()
 
-        self.query_one("#src", Input).focus()
+        # Só depois que a janela aparece, para o diálogo abrir por cima dela.
+        if "pasta_saida" not in self._config and not self._erro_ffmpeg:
+            QTimer.singleShot(0, self._primeira_configuracao)
 
-    # -- helpers ----------------------------------------------------------
+    # ------------------------------------------------------------------ UI
 
-    def write_log(self, msg: str) -> None:
-        """Escreve no painel de log. Nao pode se chamar 'log': App.log e do Textual."""
-        self.query_one("#log", RichLog).write(msg)
+    def _grupo_arquivos(self) -> QGroupBox:
+        grupo = QGroupBox("Arquivos")
+        layout = QVBoxLayout(grupo)
 
-    def current_preset(self) -> Preset:
-        return PRESET_BY_KEY[self.query_one("#preset", Select).value]
+        self.tabela = QTableWidget(0, len(COLUNAS))
+        self.tabela.setHorizontalHeaderLabels(COLUNAS)
+        self.tabela.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tabela.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tabela.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tabela.verticalHeader().setVisible(False)
+        cabecalho = self.tabela.horizontalHeader()
+        cabecalho.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        cabecalho.setSectionResizeMode(COL_ARQUIVO, QHeaderView.ResizeMode.Stretch)
+        cabecalho.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeMode.Interactive)
+        cabecalho.resizeSection(COL_STATUS, 150)
+        self.tabela.setMinimumHeight(160)
+        layout.addWidget(self.tabela, stretch=1)
+        QShortcut(QKeySequence(QKeySequence.StandardKey.Delete), self.tabela, self._remover_selecionados)
 
-    def set_label(self, text: str) -> None:
-        self.query_one("#progress-label", Static).update(text)
+        self.lbl_resumo = QLabel("Arraste pastas ou arquivos para a janela.")
+        self.lbl_resumo.setObjectName("subtitle")
+        self.lbl_resumo.setWordWrap(True)
+        layout.addWidget(self.lbl_resumo)
 
-    def set_row(self, index: int, column: str, value: str) -> None:
-        table = self.query_one("#files", DataTable)
-        table.update_cell(self.row_keys[index], column, value)
+        botoes = QHBoxLayout()
+        self.btn_add_arquivos = QPushButton("Adicionar arquivos")
+        self.btn_add_arquivos.clicked.connect(self._escolher_arquivos)
+        self.btn_add_pasta = QPushButton("Adicionar pasta")
+        self.btn_add_pasta.clicked.connect(self._escolher_pasta_entrada)
+        self.btn_remover = QPushButton("Remover selecionados")
+        self.btn_remover.setObjectName("secondary")
+        self.btn_remover.clicked.connect(self._remover_selecionados)
+        self.btn_limpar = QPushButton("Limpar lista")
+        self.btn_limpar.setObjectName("danger")
+        self.btn_limpar.clicked.connect(self._limpar)
+        botoes.addWidget(self.btn_add_arquivos)
+        botoes.addWidget(self.btn_add_pasta)
+        botoes.addWidget(self.btn_remover)
+        botoes.addWidget(self.btn_limpar)
+        botoes.addStretch(1)
+        layout.addLayout(botoes)
+        return grupo
 
-    @on(Input.Changed, "#src")
-    def suggest_output(self, event: Input.Changed) -> None:
-        """Sugere uma pasta irmã quando a saída ainda está vazia."""
-        dst = self.query_one("#dst", Input)
-        if dst.value.strip():
-            return
-        paths = split_paths(event.value)
-        if not paths:
-            return
-        base = paths[0].parent if paths[0].is_file() else paths[0]
-        if base.name:
-            dst.placeholder = str(base.parent / f"{base.name} - convertido")
+    def _grupo_opcoes(self) -> QGroupBox:
+        grupo = QGroupBox("Opções")
+        grade = QGridLayout(grupo)
+        grade.setColumnStretch(1, 1)
 
-    def on_paste(self, event: events.Paste) -> None:
-        """Drop com o foco fora dos campos de texto (tabela, botão): vai para a entrada."""
-        src = self.query_one("#src", PathInput)
-        if src.drop(event.text):
-            src.focus()
+        # Nada de QLabel com quebra de linha segurando caminho: num grid o
+        # rótulo quebrado reporta altura mínima de uma linha e acaba cortado.
+        grade.addWidget(QLabel("Preset"), 0, 0)
+        self.combo_preset = QComboBox()
+        for preset in PRESETS:
+            self.combo_preset.addItem(preset.label, preset.key)
+        indice = self.combo_preset.findData(self._config.get("preset", DEFAULT_PRESET))
+        self.combo_preset.setCurrentIndex(max(0, indice))
+        self.combo_preset.currentIndexChanged.connect(self._ao_mudar_preset)
+        grade.addWidget(self.combo_preset, 0, 1)
 
-    # -- escanear ---------------------------------------------------------
+        self.lbl_preset = QLabel("")
+        self.lbl_preset.setObjectName("subtitle")
+        grade.addWidget(self.lbl_preset, 1, 1)
 
-    def action_scan(self) -> None:
-        self.scan()
+        grade.addWidget(QLabel("Saída"), 2, 0)
+        linha_saida = QHBoxLayout()
+        self.campo_saida = QLineEdit()
+        self.campo_saida.setReadOnly(True)
+        self.btn_saida = QPushButton("Escolher pasta padrão")
+        self.btn_saida.setObjectName("secondary")
+        self.btn_saida.clicked.connect(self._escolher_pasta_saida)
+        self.btn_saida_lado = QPushButton("Ao lado da origem")
+        self.btn_saida_lado.setObjectName("secondary")
+        self.btn_saida_lado.clicked.connect(self._usar_lado_da_origem)
+        linha_saida.addWidget(self.campo_saida, stretch=1)
+        linha_saida.addWidget(self.btn_saida)
+        linha_saida.addWidget(self.btn_saida_lado)
+        grade.addLayout(linha_saida, 2, 1)
 
-    @on(Button.Pressed, "#scan")
-    @on(Input.Submitted, "#src")
-    @on(PathInput.Dropped)
-    def _on_scan(self) -> None:
-        self.scan()
+        self.lbl_saida_exemplo = QLabel("")
+        self.lbl_saida_exemplo.setObjectName("subtitle")
+        grade.addWidget(self.lbl_saida_exemplo, 3, 1)
 
-    def scan(self) -> None:
-        paths = split_paths(self.query_one("#src", Input).value)
-        if not paths:
-            self.notify("Informe a pasta ou os arquivos de entrada.", severity="warning")
-            return
-        missing = next((p for p in paths if not p.exists()), None)
-        if missing is not None:
-            self.notify(f"Não encontrado: {missing}", severity="error")
-            return
+        self._ao_mudar_preset()
+        return grupo
 
-        found = collect_videos(paths)
-        if not found:
-            self.notify("Nenhum arquivo de vídeo aí.", severity="warning")
-            return
+    def _grupo_progresso(self) -> QGroupBox:
+        grupo = QGroupBox("Andamento")
+        layout = QVBoxLayout(grupo)
 
-        self.write_log(f"\n[bold]Lendo {len(found)} arquivo(s)…[/]")
-        self.scan_worker(found)
+        self.lbl_status = QLabel("Pronto para converter.")
+        self.lbl_status.setObjectName("status")
+        self.lbl_status.setWordWrap(True)
+        layout.addWidget(self.lbl_status)
 
-    @work(thread=True, exclusive=True, group="scan")
-    def scan_worker(self, paths: list[Path]) -> None:
-        worker = get_current_worker()
-        infos: list[MediaInfo] = []
-        for path in paths:
-            if worker.is_cancelled:
-                return
-            infos.append(probe(self.ffprobe, path))
-        self.call_from_thread(self.populate, infos)
+        self.barra_arquivo = QProgressBar()
+        self.barra_arquivo.setFormat("Arquivo atual: %p%")
+        layout.addWidget(self.barra_arquivo)
 
-    def populate(self, infos: list[MediaInfo]) -> None:
-        self.files = infos
-        self.row_keys.clear()
+        self.barra_fila = QProgressBar()
+        self.barra_fila.setFormat("Fila: %p%")
+        layout.addWidget(self.barra_fila)
+        return grupo
 
-        table = self.query_one("#files", DataTable)
-        table.clear()
+    def _grupo_log(self) -> QGroupBox:
+        grupo = QGroupBox("Registro")
+        layout = QVBoxLayout(grupo)
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMinimumHeight(90)
+        # Senão o QPlainTextEdit engole o drop e cola o caminho como texto.
+        self.log.setAcceptDrops(False)
+        layout.addWidget(self.log)
+        return grupo
 
-        preset = self.current_preset()
-        total_out = 0.0
-        flagged = 0
+    def _barra_acoes(self) -> QHBoxLayout:
+        linha = QHBoxLayout()
+        linha.addStretch(1)
+        self.btn_cancelar = QPushButton("Cancelar")
+        self.btn_cancelar.setObjectName("danger")
+        self.btn_cancelar.clicked.connect(self._cancelar)
+        self.btn_converter = QPushButton("Converter")
+        self.btn_converter.clicked.connect(self._converter)
+        linha.addWidget(self.btn_cancelar)
+        linha.addWidget(self.btn_converter)
+        return linha
 
-        for info in infos:
-            rng = "full" if info.full_range else "limited"
-            if info.flagged:
-                flagged += 1
-                info.status = "converter"
-                codec_cell = f"[bold yellow]{info.codec}[/]"
-                chroma_cell = f"[bold yellow]{info.chroma}[/]"
-            else:
-                info.status = "ok no Resolve"
-                codec_cell, chroma_cell = info.codec, info.chroma
+    # --------------------------------------------------------- configuração
 
-            key = table.add_row(
-                info.path.name,
-                codec_cell,
-                info.resolution,
-                f"{info.fps:g}" if info.fps else "?",
-                chroma_cell,
-                info.depth,
-                rng,
-                info.status,
-            )
-            self.row_keys.append(key)
-            total_out += estimate_output(info, preset)
-
-        self.write_log(
-            f"{len(infos)} arquivo(s) · [bold yellow]{flagged}[/] precisam de conversão · "
-            f"saída estimada em [bold]{human_size(total_out)}[/] com {preset.key}"
+    def _primeira_configuracao(self) -> None:
+        resposta = QMessageBox.question(
+            self,
+            "Pasta padrão de saída",
+            "Para cada pasta de origem o programa cria uma pasta "
+            f"\"<nome>{transcoder.OUTPUT_SUFFIX}\" com os arquivos convertidos.\n\n"
+            "Quer escolher agora onde essas pastas serão criadas? A escolha fica "
+            "salva e pode ser alterada depois em \"Escolher pasta padrão\".\n\n"
+            "Se responder Não, cada pasta convertida é criada ao lado da pasta de origem.",
         )
-        if flagged:
-            self.write_log("[dim]Amarelo = chroma/profundidade que o Resolve free não decodifica.[/]")
+        if resposta == QMessageBox.StandardButton.Yes:
+            self._escolher_pasta_saida()
+        else:
+            self._definir_raiz(None)
 
-        self.query_one("#convert", Button).disabled = not infos
+    def _escolher_pasta_saida(self) -> None:
+        inicio = self._raiz or self._config.get("ultima_pasta") or str(Path.home())
+        pasta = QFileDialog.getExistingDirectory(self, "Pasta padrão de saída", str(inicio))
+        if pasta:
+            self._definir_raiz(Path(pasta))
 
-    @on(Select.Changed, "#preset")
-    def _on_preset(self) -> None:
-        if self.files:
-            self.populate(self.files)
+    def _usar_lado_da_origem(self) -> None:
+        self._definir_raiz(None)
 
-    # -- converter --------------------------------------------------------
+    def _definir_raiz(self, raiz: Path | None) -> None:
+        self._raiz = raiz
+        self._config["pasta_saida"] = str(raiz) if raiz else None
+        salvar_config(self._config)
+        self._atualizar_estado()
 
-    def action_convert(self) -> None:
-        self.start_conversion()
+    def _ao_mudar_preset(self) -> None:
+        self.lbl_preset.setText(self._preset().description)
+        self._config["preset"] = self._preset().key
+        salvar_config(self._config)
+        self._atualizar_resumo()
 
-    @on(Button.Pressed, "#convert")
-    def _on_convert(self) -> None:
-        self.start_conversion()
+    def _preset(self) -> Preset:
+        return PRESET_BY_KEY[self.combo_preset.currentData()]
 
-    def start_conversion(self) -> None:
-        if not self.files:
-            self.notify("Escaneie uma pasta primeiro.", severity="warning")
+    # ------------------------------------------------------------- arquivos
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - assinatura do Qt
+        if event.mimeData().hasUrls() and self._worker is None:
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - assinatura do Qt
+        if self._worker is not None:
+            return
+        caminhos = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
+        self._adicionar(caminhos)
+        event.acceptProposedAction()
+
+    def _pasta_inicial(self) -> str:
+        return self._config.get("ultima_pasta") or str(Path.home())
+
+    def _lembrar_pasta(self, caminho: Path) -> None:
+        self._config["ultima_pasta"] = str(caminho if caminho.is_dir() else caminho.parent)
+        salvar_config(self._config)
+
+    def _escolher_arquivos(self) -> None:
+        caminhos, _ = QFileDialog.getOpenFileNames(
+            self, "Adicionar arquivos", self._pasta_inicial(), FILTRO_ARQUIVOS
+        )
+        if caminhos:
+            self._lembrar_pasta(Path(caminhos[0]))
+            self._adicionar([Path(c) for c in caminhos])
+
+    def _escolher_pasta_entrada(self) -> None:
+        pasta = QFileDialog.getExistingDirectory(self, "Adicionar pasta", self._pasta_inicial())
+        if pasta:
+            self._lembrar_pasta(Path(pasta))
+            self._adicionar([Path(pasta)])
+
+    def _adicionar(self, caminhos: list[Path]) -> None:
+        if self._erro_ffmpeg:
+            QMessageBox.critical(self, "ffmpeg não encontrado", self._erro_ffmpeg)
+            return
+        na_fila = {info.path for info in self._fila}
+        novos = [c for c in transcoder.collect(caminhos) if c not in na_fila]
+        if not novos:
+            if caminhos:
+                self._escrever("Nada novo: nenhum vídeo nas pastas ou já estão na fila.")
             return
 
-        raw = clean_path(self.query_one("#dst", Input).value)
-        if not raw:
-            raw = self.query_one("#dst", Input).placeholder
-        if not raw or raw.startswith("pasta onde"):
-            self.notify("Informe a pasta de saída.", severity="warning")
+        for caminho in novos:
+            self._fila.append(MediaInfo(path=caminho, status=LENDO))
+            linha = self.tabela.rowCount()
+            self.tabela.insertRow(linha)
+            self._preencher_linha(linha, self._fila[-1])
+        self._pendentes += novos
+        self._iniciar_leitura()
+        self._atualizar_estado()
+
+    def _preencher_linha(self, linha: int, info: MediaInfo) -> None:
+        lido = info.status != LENDO and info.readable
+        rng = ("full" if info.full_range else "limited") if lido else "?"
+        valores = (
+            info.path.name,
+            info.codec,
+            info.resolution,
+            f"{info.fps:g}" if info.fps else "?",
+            info.chroma,
+            info.depth,
+            rng,
+            info.status,
+        )
+        for coluna, valor in enumerate(valores):
+            item = QTableWidgetItem(valor)
+            if coluna == COL_ARQUIVO:
+                item.setToolTip(str(info.path))
+            else:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            # Cores só da paleta do tema: azul para o que o Resolve não abre
+            # (é o que este programa existe para resolver) e o tom de erro
+            # para o que o ffprobe não leu.
+            if info.flagged and coluna in (COL_CODEC, COL_CHROMA, COL_BITS, COL_STATUS):
+                item.setForeground(QBrush(QColor(COLORS["accent"])))
+            elif not info.readable:
+                item.setForeground(QBrush(QColor(COLORS["danger_text"])))
+            self.tabela.setItem(linha, coluna, item)
+
+    def _definir_status(self, linha: int, texto: str, erro: bool = False) -> None:
+        item = self.tabela.item(linha, COL_STATUS)
+        if item is None:
+            return
+        item.setText(texto)
+        if erro:
+            item.setForeground(QBrush(QColor(COLORS["danger_text"])))
+
+    def _iniciar_leitura(self) -> None:
+        if self._leitor is not None or not self._pendentes:
+            return
+        self._leitor = LeitorWorker(self._ffprobe, list(self._pendentes))
+        self._pendentes.clear()
+        self._leitor.lido.connect(self._ao_ler)
+        self._leitor.finished.connect(self._ao_leitor_encerrar)
+        self._leitor.start()
+
+    def _ao_ler(self, info: MediaInfo) -> None:
+        # Procura pelo caminho: o usuário pode ter removido linhas enquanto
+        # o ffprobe rodava, o que desalinha qualquer índice guardado.
+        linha = next((i for i, atual in enumerate(self._fila) if atual.path == info.path), None)
+        if linha is None:
+            return
+        self._fila[linha] = info
+        self._preencher_linha(linha, info)
+        self._atualizar_resumo()
+
+    def _ao_leitor_encerrar(self) -> None:
+        leitor, self._leitor = self._leitor, None
+        if leitor is not None:
+            leitor.deleteLater()
+        self._iniciar_leitura()  # o que chegou enquanto lia
+        self._atualizar_estado()
+
+    def _remover_selecionados(self) -> None:
+        if self._worker is not None:
+            return
+        linhas = sorted({indice.row() for indice in self.tabela.selectedIndexes()}, reverse=True)
+        for linha in linhas:
+            self.tabela.removeRow(linha)
+            del self._fila[linha]
+        self._atualizar_estado()
+
+    def _limpar(self) -> None:
+        if self._worker is not None:
+            return
+        self.tabela.setRowCount(0)
+        self._fila.clear()
+        self._pendentes.clear()
+        self.barra_arquivo.setValue(0)
+        self.barra_fila.setValue(0)
+        self.lbl_status.setText("Pronto para converter.")
+        self._atualizar_estado()
+
+    # ------------------------------------------------------------ conversão
+
+    def _converter(self) -> None:
+        if not self._fila or self._worker or self._leitor:
+            return
+        if self._raiz is not None and not self._raiz.is_dir():
+            QMessageBox.warning(
+                self,
+                "Pasta de saída",
+                f"A pasta padrão de saída não existe:\n{self._raiz}\n\n"
+                "Escolha outra em \"Escolher pasta padrão\" ou use \"Salvar ao lado da origem\".",
+            )
             return
 
-        dst_dir = Path(raw).expanduser()
-        try:
-            dst_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            self.notify(f"Não consegui criar a pasta de saída: {exc}", severity="error")
-            return
+        self.barra_arquivo.setValue(0)
+        self.barra_fila.setValue(0)
+        self._escrever("")
+        self._escrever(f"Convertendo {len(self._fila)} arquivo(s) com {self._preset().label}.")
 
-        self.query_one("#convert", Button).disabled = True
-        self.query_one("#scan", Button).disabled = True
-        self.query_one("#cancel", Button).disabled = False
-        self.write_log(f"\n[bold]Saída:[/] {dst_dir}")
+        self._total = len(self._fila)
+        self._worker = ConversorWorker(self._ffmpeg, list(self._fila), self._raiz, self._preset())
+        self._worker.arquivo_iniciado.connect(self._ao_iniciar)
+        self._worker.progresso.connect(self._ao_progredir)
+        self._worker.arquivo_terminado.connect(self._ao_terminar_arquivo)
+        self._worker.fila_terminada.connect(self._ao_terminar_fila)
+        # Só solta a referência depois que a thread realmente encerrou: largar
+        # o objeto ainda rodando faz o Qt abortar o programa.
+        self._worker.finished.connect(self._ao_thread_encerrar)
+        self._worker.start()
+        self._atualizar_estado()
 
-        self.convert_worker(dst_dir, self.current_preset())
+    def _cancelar(self) -> None:
+        if self._worker:
+            self._worker.cancelar()
+            self.lbl_status.setText("Cancelando...")
+            self.btn_cancelar.setEnabled(False)
 
-    @work(thread=True, exclusive=True, group="convert")
-    def convert_worker(self, dst_dir: Path, preset: Preset) -> None:
-        worker = get_current_worker()
-        bar = self.query_one("#bar", ProgressBar)
-        total = len(self.files)
-        done = failed = skipped = 0
+    def _ao_iniciar(self, indice: int, nome: str, destino: str) -> None:
+        self.lbl_status.setText(f"Convertendo {indice + 1} de {self._total}: {nome}")
+        self.barra_arquivo.setValue(0)
+        self._definir_status(indice, "convertendo")
+        self._escrever(f"--- {nome} -> {destino}")
 
-        for index, info in enumerate(self.files):
-            if worker.is_cancelled:
-                break
+    def _ao_progredir(self, indice: int, fracao: float, velocidade: str) -> None:
+        self.barra_arquivo.setValue(int(fracao * 100))
+        self.barra_fila.setValue(int((indice + fracao) / max(1, self._total) * 100))
+        if velocidade:
+            nome = self._fila[indice].path.name
+            self.lbl_status.setText(
+                f"Convertendo {indice + 1} de {self._total}: {nome} ({velocidade})"
+            )
 
-            if info.status == "ilegivel":
-                skipped += 1
-                continue
-
-            dst = dst_dir / f"{info.path.stem}{OUTPUT_EXT}"
-
-            # Entrada e saida em mp4: se a pasta for a mesma, o ffmpeg
-            # escreveria por cima do original.
+    def _ao_terminar_arquivo(self, indice: int, estado: str, mensagem: str) -> None:
+        nome = self._fila[indice].path.name
+        if estado == "ok":
             try:
-                same_file = dst.resolve() == info.path.resolve()
+                tamanho = transcoder.human_size(Path(mensagem).stat().st_size)
             except OSError:
-                same_file = False
-            if same_file:
-                skipped += 1
-                self.call_from_thread(self.set_row, index, "status", "[yellow]mesmo arquivo[/]")
-                self.call_from_thread(
-                    self.write_log,
-                    f"[yellow]{info.path.name}:[/] pulado — a saída sobrescreveria o original.",
-                )
-                continue
+                tamanho = "?"
+            self._definir_status(indice, f"pronto · {tamanho}")
+            self._escrever(f"Pronto: {mensagem} ({tamanho})")
+        elif estado == "existe":
+            self._definir_status(indice, "já existe")
+            self._escrever(f"Já existe, pulado: {mensagem}")
+        elif estado == "pulado":
+            self._definir_status(indice, "pulado")
+            self._escrever(f"Pulado ({nome}): {mensagem}")
+        elif estado == "cancelado":
+            self._definir_status(indice, "cancelado")
+            self._escrever(f"Cancelado: {nome}")
+        else:
+            self._definir_status(indice, "falhou", erro=True)
+            self._escrever(f"Falhou ({nome}): {mensagem}")
+        if estado != "cancelado":
+            self.barra_fila.setValue(int((indice + 1) / max(1, self._total) * 100))
 
-            if dst.exists() and dst.stat().st_mtime >= info.path.stat().st_mtime:
-                skipped += 1
-                self.call_from_thread(self.set_row, index, "status", "já existe")
-                continue
+    def _ao_terminar_fila(self, ok: int, falhas: int, pulados: int, cancelado: bool) -> None:
+        partes = [f"{ok} convertido(s)"]
+        if falhas:
+            partes.append(f"{falhas} com falha")
+        if pulados:
+            partes.append(f"{pulados} pulado(s)")
+        resumo = ", ".join(partes)
+        if cancelado:
+            self.lbl_status.setText(f"Cancelado. {resumo} antes de parar.")
+        else:
+            self.barra_fila.setValue(100)
+            self.lbl_status.setText(f"Terminado: {resumo}.")
+        self._escrever(self.lbl_status.text())
 
-            self.call_from_thread(
-                self.set_label, f"{index + 1}/{total} · {info.path.name}"
+    def _ao_thread_encerrar(self) -> None:
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            worker.deleteLater()
+        self.btn_cancelar.setEnabled(True)
+        self._atualizar_estado()
+
+    # ---------------------------------------------------------------- estado
+
+    def _escrever(self, texto: str) -> None:
+        self.log.appendPlainText(texto)
+
+    def _atualizar_resumo(self) -> None:
+        if not self._fila:
+            self.lbl_resumo.setText("Arraste pastas ou arquivos para a janela.")
+            return
+        lendo = sum(1 for info in self._fila if info.status == LENDO)
+        legiveis = [info for info in self._fila if info.readable and info.status != LENDO]
+        sinalizados = sum(1 for info in legiveis if info.flagged)
+        preset = self._preset()
+        estimado = sum(transcoder.estimate_output(info, preset) for info in legiveis)
+        texto = f"{len(self._fila)} arquivo(s)"
+        if lendo:
+            texto += f" · lendo {lendo}..."
+        texto += f" · {sinalizados} que o Resolve free não abre"
+        if estimado:
+            texto += f" · saída estimada em {transcoder.human_size(estimado)} com {preset.label}"
+        self.lbl_resumo.setText(texto)
+
+    def _atualizar_estado(self) -> None:
+        rodando = self._worker is not None
+        lendo = self._leitor is not None
+        sem_ffmpeg = bool(self._erro_ffmpeg)
+
+        self.btn_converter.setEnabled(bool(self._fila) and not rodando and not lendo and not sem_ffmpeg)
+        self.btn_cancelar.setEnabled(rodando)
+        # Mexer na fila durante a conversão desalinharia os índices que o
+        # worker está usando para reportar o andamento.
+        for botao in (self.btn_add_arquivos, self.btn_add_pasta):
+            botao.setEnabled(not rodando and not sem_ffmpeg)
+        for botao in (self.btn_remover, self.btn_limpar):
+            botao.setEnabled(not rodando and bool(self._fila))
+        for widget in (self.combo_preset, self.btn_saida, self.btn_saida_lado):
+            widget.setEnabled(not rodando)
+
+        if self._raiz is not None:
+            self.campo_saida.setText(str(self._raiz))
+            self.campo_saida.setToolTip(str(self._raiz))
+        else:
+            self.campo_saida.setText("Sem pasta padrão: ao lado de cada pasta de origem")
+            self.campo_saida.setToolTip("")
+        self.btn_saida_lado.setEnabled(not rodando and self._raiz is not None)
+
+        if self._fila:
+            primeiro = self._fila[0].path
+            destino = transcoder.output_path(primeiro, self._raiz)
+            onde = "na pasta padrão" if self._raiz is not None else f"ao lado da pasta {primeiro.parent.name}"
+            self.lbl_saida_exemplo.setText(
+                f"Ex.: {primeiro.name} vai para {destino.parent.name}/{destino.name}, {onde}"
             )
-            self.call_from_thread(self.set_row, index, "status", "convertendo")
-            self.call_from_thread(bar.update, total=100, progress=0)
-
-            cmd = build_cmd(self.ffmpeg, info, dst, preset)
-            self.call_from_thread(self.write_log, f"[dim]$ {subprocess.list2cmdline(cmd)}[/]")
-
-            ok, tail = self._run_ffmpeg(cmd, info, worker)
-
-            if worker.is_cancelled:
-                self.call_from_thread(self.set_row, index, "status", "cancelado")
-                dst.unlink(missing_ok=True)
-                break
-
-            if ok:
-                done += 1
-                size = human_size(dst.stat().st_size) if dst.exists() else "?"
-                self.call_from_thread(self.set_row, index, "status", f"pronto · {size}")
-            else:
-                failed += 1
-                dst.unlink(missing_ok=True)
-                self.call_from_thread(self.set_row, index, "status", "[red]falhou[/]")
-                self.call_from_thread(self.write_log, f"[red]{info.path.name}:[/] {tail}")
-
-        self.call_from_thread(self.finish, done, failed, skipped, worker.is_cancelled)
-
-    def _run_ffmpeg(self, cmd: list[str], info: MediaInfo, worker) -> tuple[bool, str]:
-        bar = self.query_one("#bar", ProgressBar)
-        errors: list[str] = []
-
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-                bufsize=1,
-                creationflags=CREATE_NO_WINDOW,
+            self.lbl_saida_exemplo.setToolTip(str(destino))
+        else:
+            self.lbl_saida_exemplo.setText(
+                f"Os convertidos ficam em uma pasta \"<nome da pasta de origem>{transcoder.OUTPUT_SUFFIX}\"."
             )
-        except OSError as exc:
-            return False, str(exc)
+            self.lbl_saida_exemplo.setToolTip("")
+        self._atualizar_resumo()
 
-        self._proc = proc
-        assert proc.stdout is not None
-
-        for line in proc.stdout:
-            if worker.is_cancelled:
-                proc.terminate()
-                break
-
-            match = TIME_RE.search(line)
-            if match and info.duration:
-                h, m, s = match.groups()
-                elapsed = int(h) * 3600 + int(m) * 60 + float(s)
-                pct = min(100.0, elapsed / info.duration * 100)
-                self.call_from_thread(bar.update, progress=pct)
-            elif "=" not in line and line.strip():
-                errors.append(line.rstrip())
-
-        proc.wait()
-        self._proc = None
-        tail = " · ".join(errors[-3:]) if errors else f"código {proc.returncode}"
-        return proc.returncode == 0, tail
-
-    def finish(self, done: int, failed: int, skipped: int, cancelled: bool) -> None:
-        self.query_one("#convert", Button).disabled = False
-        self.query_one("#scan", Button).disabled = False
-        self.query_one("#cancel", Button).disabled = True
-        self.query_one("#bar", ProgressBar).update(progress=0)
-
-        verb = "Cancelado" if cancelled else "Concluído"
-        self.set_label(verb.lower())
-        self.write_log(
-            f"[bold]{verb}:[/] {done} convertido(s), {failed} falha(s), {skipped} pulado(s)."
-        )
-        self.notify(f"{verb}: {done} convertido(s), {failed} falha(s).")
-
-    # -- cancelar ---------------------------------------------------------
-
-    def action_cancel(self) -> None:
-        self.cancel_run()
-
-    @on(Button.Pressed, "#cancel")
-    def _on_cancel(self) -> None:
-        self.cancel_run()
-
-    def cancel_run(self) -> None:
-        self.workers.cancel_group(self, "convert")
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
-        self.write_log("[yellow]Cancelando…[/]")
+    def closeEvent(self, event) -> None:  # noqa: N802 - assinatura do Qt
+        if self._worker:
+            resposta = QMessageBox.question(
+                self, "Conversão em andamento", "Cancelar a conversão e sair?"
+            )
+            if resposta != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self._worker.cancelar()
+            self._worker.wait(10000)
+        if self._leitor:
+            self._leitor.cancelar()
+            self._leitor.wait(5000)
+        event.accept()
 
 
-def main() -> None:
-    ResolvePrep().run()
+def main() -> int:
+    app = QApplication(sys.argv)
+    apply_theme(app)
+    set_default_font(app)
+    janela = Janela()
+    janela.show()
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
